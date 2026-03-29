@@ -51,8 +51,8 @@ async function upsertBatched(
     const batch = rows.slice(i, i + BATCH)
     const { error, count } = await client
       .from(table)
-      .upsert(batch, { onConflict, ignoreDuplicates: false })
-      .select('id', { count: 'exact', head: true })
+      .upsert(batch, { onConflict, ignoreDuplicates: false, count: 'exact' })
+      .select('id')
     if (error) throw new Error(`Supabase upsert ${table}: ${error.message}`)
     total += count ?? batch.length
   }
