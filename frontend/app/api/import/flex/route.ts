@@ -246,7 +246,7 @@ export async function POST(req: NextRequest) {
 
     const updatePromises: Promise<unknown>[] = []
 
-    for (const [campaignId, ibkrIds] of byCampaign) {
+    for (const [campaignId, ibkrIds] of Array.from(byCampaign.entries())) {
       for (let i = 0; i < ibkrIds.length; i += BATCH) {
         const batch = ibkrIds.slice(i, i + BATCH)
         updatePromises.push(
@@ -259,7 +259,7 @@ export async function POST(req: NextRequest) {
     }
 
     // Update leg_group_id individually (each row can differ)
-    for (const [ibkrId, lgId] of legGroupMap) {
+    for (const [ibkrId, lgId] of Array.from(legGroupMap.entries())) {
       updatePromises.push(
         supabase
           .from('raw_executions')
