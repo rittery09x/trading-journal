@@ -1,0 +1,60 @@
+version: "3.9"
+
+# ── How env vars work ──────────────────────────────────────────────────────────
+# Local dev   : copy .env.example → .env in this directory; docker-compose
+#               reads it automatically.
+# Coolify     : set all variables in the Coolify "Environment Variables" panel;
+#               no .env file needed on the server.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Python / FastAPI grouping service ────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: trading-journal-backend
+    restart: unless-stopped
+    environment:
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-http://localhost:3000}
+    # Healthcheck is defined inside the Dockerfile (curl /health)
+
+  # ── Next.js frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # These two are embedded into the client bundle at build time.
+        # They must be provided as build args AND as runtime env vars.
+        NEXT_PUBLIC_SUPABASE_URL:  ${NEXT_PUBLIC_SUPABASE_URL}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+    container_name: trading-journal-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      # ── Supabase ──────────────────────────────────────────────────────────────
+      - NEXT_PUBLIC_SUPABASE_URL=${NEXT_PUBLIC_SUPABASE_URL}
+      - NEXT_PUBLIC_SUPABASE_ANON_KEY=${NEXT_PUBLIC_SUPABASE_ANON_KEY}
+      - SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+      # ── IBKR Flex Query ───────────────────────────────────────────────────────
+      - FLEX_QUERY_TOKEN=${FLEX_QUERY_TOKEN}
+      - FLEX_QUERY_ID_ACTIVITY=${FLEX_QUERY_ID_ACTIVITY}
+      - FLEX_QUERY_ID_CONFIRMS=${FLEX_QUERY_ID_CONFIRMS}
+      # ── Security ──────────────────────────────────────────────────────────────
+      - IMPORT_SECRET=${IMPORT_SECRET}
+      # ── Internal service URL (Docker network — do not change) ─────────────────
+      - PYTHON_PARSER_URL=http://backend:8000
+      # ── App ───────────────────────────────────────────────────────────────────
+      - NEXT_PUBLIC_APP_URL=${NEXT_PUBLIC_APP_URL:-https://trading.cari-digital.de}
+      # ── SMTP (optional — only needed for weekly email report) ─────────────────
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASS=${SMTP_PASS:-}
+      - REPORT_EMAIL=${REPORT_EMAIL:-}
