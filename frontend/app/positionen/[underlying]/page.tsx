@@ -44,7 +44,7 @@ async function fetchCampaign(underlying: string) {
 
     return {
       campaign: campaign as Campaign,
-      legs:     (legs ?? []) as OptionLeg[],
+      legs:     (legs ?? []) as unknown as OptionLeg[],
       executions: executions ?? [],
     }
   } catch {
@@ -263,7 +263,7 @@ export default async function UnderlyingPage({
           <h2 className="text-sm font-medium text-foreground mb-4">
             Ausführungen ({executions.length})
           </h2>
-          <ExecutionsTable executions={executions as Record<string, unknown>[]} />
+          <ExecutionsTable executions={executions as unknown as Record<string, unknown>[]} />
         </div>
       )}
     </div>

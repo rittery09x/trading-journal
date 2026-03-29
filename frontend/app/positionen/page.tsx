@@ -25,7 +25,7 @@ async function fetchCampaigns(status?: string): Promise<Campaign[]> {
     }
 
     const { data } = await q
-    return (data ?? []) as Campaign[]
+    return (data ?? []) as unknown as Campaign[]
   } catch {
     return []
   }

@@ -43,7 +43,7 @@ function groupByMonth(legs: ClosedLeg[]): MonthlyRow[] {
     map.set(key, cur)
   }
   let cumulative = 0
-  return [...map.entries()]
+  return Array.from(map.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([month, data]) => {
       cumulative += data.net

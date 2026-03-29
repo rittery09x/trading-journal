@@ -244,7 +244,7 @@ export async function POST(req: NextRequest) {
       if (lgId) legGroupMap.set(ibkrId, lgId)
     }
 
-    const updatePromises: Promise<unknown>[] = []
+    const updatePromises: PromiseLike<unknown>[] = []
 
     for (const [campaignId, ibkrIds] of Array.from(byCampaign.entries())) {
       for (let i = 0; i < ibkrIds.length; i += BATCH) {
@@ -253,7 +253,8 @@ export async function POST(req: NextRequest) {
           supabase
             .from('raw_executions')
             .update({ campaign_id: campaignId })
-            .in('ibkr_trade_id', batch),
+            .in('ibkr_trade_id', batch)
+            .then(),
         )
       }
     }
@@ -264,7 +265,8 @@ export async function POST(req: NextRequest) {
         supabase
           .from('raw_executions')
           .update({ leg_group_id: lgId })
-          .eq('ibkr_trade_id', ibkrId),
+          .eq('ibkr_trade_id', ibkrId)
+          .then(),
       )
     }
 

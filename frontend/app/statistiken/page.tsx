@@ -90,7 +90,7 @@ export default async function StatistikenPage() {
     })
   }
   // Merge multi-entry underlyings (shouldn't happen with 1:1 campaigns, but be safe)
-  const sortedByPnl = [...byUnderlying.entries()]
+  const sortedByPnl = Array.from(byUnderlying.entries())
     .sort(([, a], [, b]) => b.pnl - a.pnl)
 
   const openCampaigns   = campaigns.filter((c) => c.status === 'open')
