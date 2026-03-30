@@ -80,6 +80,16 @@ async function pollStatement(
       throw new Error(`IBKR GetStatement error (${code}): ${msg}`)
     }
 
+    // IBKR returns a FlexStatementResponse on errors (e.g. rate limit 1018)
+    if (xml.includes('<FlexStatementResponse')) {
+      const status = extractTag(xml, 'Status')
+      if (status !== 'Success') {
+        const code = extractTag(xml, 'ErrorCode')
+        const msg  = extractTag(xml, 'ErrorMessage')
+        throw new Error(`IBKR error (${code}): ${msg}`)
+      }
+    }
+
     // Actual statement XML received
     return xml
   }
