@@ -185,7 +185,9 @@ def build_campaigns_and_legs(df: pd.DataFrame) -> dict:
                 camp["started_at"] = trade_date
 
             # Stock quantity tracking
-            qty = _float(r.get("quantity")) or 0.0
+            # Use abs() because IBKR reports SELL quantities as negative values;
+            # direction is already captured by action (BUY/SELL).
+            qty = abs(_float(r.get("quantity")) or 0.0)
             if asset_class == "STK":
                 if action == "BUY":
                     camp["stock_quantity"] += qty
@@ -211,9 +213,13 @@ def build_campaigns_and_legs(df: pd.DataFrame) -> dict:
             oci    = _str(r.get("open_close_indicator")).upper()
             status = _leg_status(r)
 
-            # Track open legs per campaign
-            if camp_id and oci == "O" and status == "open":
-                campaigns_map[camp_id]["open_option_legs"] += 1
+            # Track open legs per campaign:
+            # +1 for opening executions, -1 for closing executions (BTC/assigned/rolled)
+            if camp_id:
+                if oci == "O" and status == "open":
+                    campaigns_map[camp_id]["open_option_legs"] += 1
+                elif oci == "C" and status in ("closed", "assigned", "rolled"):
+                    campaigns_map[camp_id]["open_option_legs"] -= 1
 
             # Net PnL
             gross_pnl  = _float(r.get("realized_pnl"))
@@ -264,6 +270,8 @@ def build_campaigns_and_legs(df: pd.DataFrame) -> dict:
 
     # ── Finalize campaign status ────────────────────────────────────────────
     for camp in campaigns_map.values():
+        camp["open_option_legs"] = max(0, camp["open_option_legs"])
+        camp["stock_quantity"]   = max(0.0, camp["stock_quantity"])
         if camp["open_option_legs"] == 0 and camp["stock_quantity"] == 0:
             camp["status"] = "closed"
         # Effective avg cost: broker cost minus collected premiums per share
