@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import { createServiceClient } from '@/lib/supabase/server'
 import Link from 'next/link'
 import type { Campaign, OptionLeg } from '@/lib/types'

@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import { createServiceClient } from '@/lib/supabase/server'
 import { StatsRow } from '@/components/dashboard/stats-cards'
 import { PnlChart } from '@/components/dashboard/pnl-chart'

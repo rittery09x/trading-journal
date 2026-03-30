@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import { ChevronLeft, TrendingUp, TrendingDown, Package } from 'lucide-react'

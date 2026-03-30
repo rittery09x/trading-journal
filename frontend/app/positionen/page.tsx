@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import Link from 'next/link'
 import { ArrowUpRight } from 'lucide-react'
 import { createServiceClient } from '@/lib/supabase/server'

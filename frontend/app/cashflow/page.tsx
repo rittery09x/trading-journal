@@ -1,3 +1,5 @@
+export const dynamic = 'force-dynamic'
+
 import { createServiceClient } from '@/lib/supabase/server'
 import { MonthlyChart } from '@/components/cashflow/monthly-chart'
 import type { MonthlyRow } from '@/components/cashflow/monthly-chart'
