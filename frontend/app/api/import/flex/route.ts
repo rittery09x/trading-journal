@@ -1,22 +1,11 @@
 /**
  * POST /api/import/flex
  * =====================
- * Authenticates via Bearer token (IMPORT_SECRET), fetches both IBKR Flex
- * Queries in parallel (AF + TCF), parses them via the Python microservice,
- * and persists everything to Supabase.
+ * Fetches both IBKR Flex Queries (AF + TCF), parses via Python, stores raw data,
+ * then delegates grouping to /api/recompute.
  *
- * Flow:
- *   1. Auth check
- *   2. Fetch AF + TCF from IBKR in parallel (with async polling)
- *   3. POST /parse → Python → structured executions + fx + cash + snapshots
- *   4. Upsert raw_executions, fx_transactions, cash_transactions, account_snapshots
- *   5. POST /group → Python → campaigns + option_legs + execution_updates
- *      (uses ALL raw_executions from Supabase for cross-import roll detection)
- *   6. Upsert campaigns, option_legs
- *   7. Batch-update raw_executions with campaign_id + leg_group_id
- *
- * Every step is logged to the import_logs table with the same import_run_id
- * so all entries for a single run can be grouped together.
+ * Auth: Bearer token (IMPORT_SECRET env var).
+ * Credentials (token + query IDs) are read from app_settings DB, falling back to env vars.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -24,12 +13,11 @@ import { fetchFlexQuery } from '@/lib/ibkr'
 import { createServiceClient } from '@/lib/supabase/server'
 import { logImport } from '@/lib/logger'
 
-export const runtime    = 'nodejs'
-export const maxDuration = 120  // 2 min — Flex Query polling can take up to 60s
+export const runtime     = 'nodejs'
+export const maxDuration = 120
 
 const PARSER_URL = process.env.PYTHON_PARSER_URL ?? 'http://backend:8000'
-
-// ── Auth ──────────────────────────────────────────────────────────────────────
+const BATCH      = 500
 
 function isAuthorized(req: NextRequest): boolean {
   const header = req.headers.get('authorization') ?? ''
@@ -38,15 +26,12 @@ function isAuthorized(req: NextRequest): boolean {
   return header === `Bearer ${secret}`
 }
 
-// ── Supabase batch helpers ────────────────────────────────────────────────────
-
-const BATCH = 500  // max rows per Supabase upsert call
+type RawExec = Record<string, unknown>
 
 async function upsertBatched(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   client: ReturnType<typeof createServiceClient>,
   table: string,
-  rows: Record<string, unknown>[],
+  rows: RawExec[],
   onConflict: string,
 ): Promise<number> {
   if (rows.length === 0) return 0
@@ -63,82 +48,76 @@ async function upsertBatched(
   return total
 }
 
-// ── Mappers: strip non-DB fields from parser output ───────────────────────────
-
-type RawExec = Record<string, unknown>
-
-function toRawExecution(exec: RawExec): RawExec {
+function toRawExecution(e: RawExec): RawExec {
   return {
-    ibkr_trade_id:        exec.ibkr_trade_id,
-    account_id:           exec.account_id ?? null,
-    symbol:               exec.symbol,
-    underlying:           exec.underlying ?? null,
-    asset_class:          exec.asset_class,
-    action:               exec.action,
-    quantity:             exec.quantity,
-    price:                exec.price,
-    currency:             exec.currency,
-    commission:           exec.commission ?? 0,
-    realized_pnl:         exec.realized_pnl ?? null,
-    trade_date:           exec.trade_date,
-    settle_date:          exec.settle_date ?? null,
-    option_expiry:        exec.option_expiry ?? null,
-    option_strike:        exec.option_strike ?? null,
-    option_type:          exec.option_type ?? null,
-    option_multiplier:    exec.option_multiplier ?? 100,
-    notes:                exec.notes ?? null,
-    brokerage_order_id:   exec.brokerage_order_id ?? null,
-    open_close_indicator: exec.open_close_indicator ?? null,
-    is_expired:           exec.is_expired ?? false,
-    is_assignment:        exec.is_assignment ?? false,
-    is_sto:               exec.is_sto ?? false,
-    is_btc:               exec.is_btc ?? false,
+    ibkr_trade_id:        e.ibkr_trade_id,
+    account_id:           e.account_id           ?? null,
+    symbol:               e.symbol,
+    underlying:           e.underlying            ?? null,
+    asset_class:          e.asset_class,
+    action:               e.action,
+    quantity:             e.quantity,
+    price:                e.price,
+    currency:             e.currency,
+    commission:           e.commission            ?? 0,
+    realized_pnl:         e.realized_pnl          ?? null,
+    trade_date:           e.trade_date,
+    settle_date:          e.settle_date           ?? null,
+    option_expiry:        e.option_expiry         ?? null,
+    option_strike:        e.option_strike         ?? null,
+    option_type:          e.option_type           ?? null,
+    option_multiplier:    e.option_multiplier      ?? 100,
+    notes:                e.notes                 ?? null,
+    brokerage_order_id:   e.brokerage_order_id    ?? null,
+    open_close_indicator: e.open_close_indicator  ?? null,
+    is_expired:           e.is_expired            ?? false,
+    is_assignment:        e.is_assignment         ?? false,
+    is_sto:               e.is_sto                ?? false,
+    is_btc:               e.is_btc                ?? false,
   }
 }
 
-function toFxTransaction(fx: RawExec): RawExec {
+function toFxTransaction(f: RawExec): RawExec {
+  let ibkrId = f.ibkr_trade_id as string | null
+  if (!ibkrId) {
+    const base = `${f.trade_date}|${f.from_currency}|${f.to_currency}|${f.from_amount}|${f.to_amount}|${f.rate}|${f.description ?? ''}`
+    const hash = Buffer.from(base).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)
+    ibkrId = `fx-${hash}`
+  }
   return {
-    ibkr_trade_id:  fx.ibkr_trade_id,
-    from_currency:  fx.from_currency,
-    to_currency:    fx.to_currency,
-    from_amount:    fx.from_amount,
-    to_amount:      fx.to_amount,
-    rate:           fx.rate,
-    trade_date:     fx.trade_date,
-    description:    fx.description ?? null,
+    ibkr_trade_id: ibkrId,
+    from_currency:  f.from_currency,
+    to_currency:    f.to_currency,
+    from_amount:    f.from_amount,
+    to_amount:      f.to_amount,
+    rate:           f.rate,
+    trade_date:     f.trade_date,
+    description:    f.description ?? null,
   }
 }
 
-function toCashTransaction(cash: RawExec): RawExec {
+function toCashTransaction(c: RawExec): RawExec {
   return {
-    ibkr_trade_id: cash.ibkr_trade_id ?? null,
-    type:          cash.type,
-    amount:        cash.amount,
-    currency:      cash.currency,
-    description:   cash.description,
-    date:          cash.date,
+    ibkr_trade_id: c.ibkr_trade_id ?? null,
+    type:          c.type,
+    amount:        c.amount,
+    currency:      c.currency,
+    description:   c.description,
+    date:          c.date,
     campaign_id:   null,
   }
 }
 
-function toAccountSnapshot(snap: RawExec): RawExec {
+function toAccountSnapshot(s: RawExec): RawExec {
   return {
-    snapshot_date:       snap.snapshot_date,
-    net_liquidation_eur: snap.net_liquidation_eur,
-    net_liquidation_usd: snap.net_liquidation_usd,
-    cash_eur:            snap.cash_eur,
-    cash_usd:            snap.cash_usd,
-    raw_data:            snap.raw_data ?? null,
+    snapshot_date:       s.snapshot_date,
+    net_liquidation_eur: s.net_liquidation_eur,
+    net_liquidation_usd: s.net_liquidation_usd,
+    cash_eur:            s.cash_eur,
+    cash_usd:            s.cash_usd,
+    raw_data:            s.raw_data ?? null,
   }
 }
-
-function toOptionLeg(leg: RawExec): RawExec {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { execution_ibkr_id, ...rest } = leg as { execution_ibkr_id?: unknown } & RawExec
-  return rest
-}
-
-// ── POST handler ──────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   if (!isAuthorized(req)) {
@@ -168,15 +147,13 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  // Every log entry in this run shares the same runId for easy filtering
   const runId = crypto.randomUUID()
 
   try {
     const supabase = createServiceClient()
+    await logImport('info', 'system', 'IBKR-Import gestartet', { query_af: queryAF, query_tcf: queryTCF }, runId)
 
-    await logImport('info', 'system', 'Import gestartet', { query_af: queryAF, query_tcf: queryTCF }, runId)
-
-    // ── 1. Fetch both Flex Queries from IBKR in parallel ─────────────────────
+    // ── 1. Fetch from IBKR ────────────────────────────────────────────────────
     await logImport('info', 'ibkr', 'IBKR Flex Queries werden abgerufen…', undefined, runId)
     let activityXml: string
     let confirmsXml: string
@@ -192,182 +169,76 @@ export async function POST(req: NextRequest) {
     }
     await logImport('info', 'ibkr', 'IBKR Flex Queries erfolgreich abgerufen', undefined, runId)
 
-    // ── 2. Parse via Python microservice ─────────────────────────────────────
+    // ── 2. Parse ──────────────────────────────────────────────────────────────
     await logImport('info', 'parser', 'Parser-Microservice wird aufgerufen…', undefined, runId)
     let parsed: Record<string, unknown>
     try {
-      const parseRes = await fetch(`${PARSER_URL}/parse`, {
+      const res = await fetch(`${PARSER_URL}/parse`, {
         method:  'POST',
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ activity_xml: activityXml, confirms_xml: confirmsXml }),
       })
-      if (!parseRes.ok) {
-        const detail = await parseRes.text()
-        throw new Error(`Parser HTTP ${parseRes.status}: ${detail}`)
-      }
-      parsed = await parseRes.json() as Record<string, unknown>
+      if (!res.ok) throw new Error(`Parser HTTP ${res.status}: ${await res.text()}`)
+      parsed = await res.json() as Record<string, unknown>
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       await logImport('error', 'parser', `Parser fehlgeschlagen: ${msg}`, undefined, runId)
       throw err
     }
 
-    const newExecutions: RawExec[]  = parsed.executions        as RawExec[] ?? []
-    const fxTransactions: RawExec[] = parsed.fx_transactions   as RawExec[] ?? []
-    const cashTxns: RawExec[]       = parsed.cash_transactions as RawExec[] ?? []
-    const snapshots: RawExec[]      = parsed.account_snapshots as RawExec[] ?? []
+    const newExecutions  = parsed.executions         as RawExec[] ?? []
+    const fxTransactions = parsed.fx_transactions    as RawExec[] ?? []
+    const cashTxns       = parsed.cash_transactions  as RawExec[] ?? []
+    const snapshots      = parsed.account_snapshots  as RawExec[] ?? []
 
     await logImport('info', 'parser', 'Parsing abgeschlossen', {
-      executions:        newExecutions.length,
-      fx_transactions:   fxTransactions.length,
-      cash_transactions: cashTxns.length,
-      account_snapshots: snapshots.length,
+      executions: newExecutions.length, fx_transactions: fxTransactions.length,
+      cash_transactions: cashTxns.length, account_snapshots: snapshots.length,
     }, runId)
 
-    // ── 3. Upsert raw data to Supabase ────────────────────────────────────────
-    await logImport('info', 'supabase', 'Rohdaten werden in Supabase gespeichert…', undefined, runId)
+    // ── 3. Upsert raw data ────────────────────────────────────────────────────
+    await logImport('info', 'supabase', 'Rohdaten werden gespeichert…', undefined, runId)
     try {
       await Promise.all([
-        upsertBatched(supabase, 'raw_executions',    newExecutions.map(toRawExecution),   'ibkr_trade_id'),
+        upsertBatched(supabase, 'raw_executions',    newExecutions.map(toRawExecution),  'ibkr_trade_id'),
         upsertBatched(supabase, 'fx_transactions',   fxTransactions.map(toFxTransaction), 'ibkr_trade_id'),
         upsertBatched(supabase, 'account_snapshots', snapshots.map(toAccountSnapshot),    'snapshot_date'),
       ])
-
       const cashWithId  = cashTxns.filter(c => c.ibkr_trade_id).map(toCashTransaction)
       const cashWithout = cashTxns.filter(c => !c.ibkr_trade_id).map(toCashTransaction)
-      if (cashWithId.length > 0) {
+      if (cashWithId.length > 0)
         await upsertBatched(supabase, 'cash_transactions', cashWithId, 'ibkr_trade_id')
-      }
       if (cashWithout.length > 0) {
-        for (let i = 0; i < cashWithout.length; i += BATCH) {
+        for (let i = 0; i < cashWithout.length; i += BATCH)
           await supabase.from('cash_transactions').insert(cashWithout.slice(i, i + BATCH))
-        }
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       await logImport('error', 'supabase', `Supabase-Upsert fehlgeschlagen: ${msg}`, undefined, runId)
       throw err
     }
-    await logImport('info', 'supabase', 'Rohdaten gespeichert', {
+
+    await logImport('info', 'supabase', 'Rohdaten gespeichert — starte Grouping…', {
       executions: newExecutions.length,
-      snapshots:  snapshots.length,
     }, runId)
 
-    // ── 4. Fetch ALL executions from Supabase for full re-grouping ────────────
-    const { data: allExecutions, error: fetchErr } = await supabase
-      .from('raw_executions')
-      .select('*')
-      .order('trade_date', { ascending: true })
-    if (fetchErr) throw new Error(`Fetch all executions: ${fetchErr.message}`)
+    // ── 4. Trigger recompute ──────────────────────────────────────────────────
+    const appUrl    = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+    const recompRes = await fetch(`${appUrl}/api/recompute`, { method: 'POST' })
+    const recomp    = await recompRes.json() as Record<string, unknown>
+    if (!recompRes.ok) throw new Error(`Recompute fehlgeschlagen: ${recomp.error ?? recompRes.status}`)
 
-    await logImport('info', 'parser', 'Grouping-Engine wird aufgerufen…', {
-      total_executions: allExecutions?.length ?? 0,
-    }, runId)
-
-    // ── 5. Run grouping engine via Python ─────────────────────────────────────
-    let grouped: Record<string, unknown>
-    try {
-      const groupRes = await fetch(`${PARSER_URL}/group`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ executions: allExecutions }),
-      })
-      if (!groupRes.ok) {
-        const detail = await groupRes.text()
-        throw new Error(`Grouping HTTP ${groupRes.status}: ${detail}`)
-      }
-      grouped = await groupRes.json() as Record<string, unknown>
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      await logImport('error', 'parser', `Grouping-Engine fehlgeschlagen: ${msg}`, undefined, runId)
-      throw err
-    }
-
-    const campaigns:   RawExec[] = grouped.campaigns         as RawExec[] ?? []
-    const optionLegs:  RawExec[] = grouped.option_legs       as RawExec[] ?? []
-    const execUpdates: RawExec[] = grouped.execution_updates as RawExec[] ?? []
-    const stats = grouped.stats as Record<string, number> | undefined
-
-    await logImport('info', 'parser', 'Grouping abgeschlossen', {
-      campaigns:   campaigns.length,
-      option_legs: optionLegs.length,
-      rolls:       stats?.rolls ?? 0,
-    }, runId)
-
-    // ── 6. Upsert campaigns + option_legs ─────────────────────────────────────
-    await logImport('info', 'supabase', 'Campaigns und Legs werden gespeichert…', undefined, runId)
-    try {
-      await upsertBatched(supabase, 'campaigns', campaigns, 'id')
-
-      const legsWithoutRef = optionLegs.map(l => ({ ...toOptionLeg(l), rolled_to_leg_id: null }))
-      await upsertBatched(supabase, 'option_legs', legsWithoutRef, 'id')
-
-      const rollRefs = optionLegs.filter(l => l.rolled_to_leg_id)
-      for (const leg of rollRefs) {
-        await supabase
-          .from('option_legs')
-          .update({ rolled_to_leg_id: leg.rolled_to_leg_id })
-          .eq('id', leg.id)
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      await logImport('error', 'supabase', `Campaign-Upsert fehlgeschlagen: ${msg}`, undefined, runId)
-      throw err
-    }
-
-    // ── 7. Batch-update raw_executions with campaign_id + leg_group_id ────────
-    const byCampaign  = new Map<string | null, string[]>()
-    const legGroupMap = new Map<string, string>()
-
-    for (const u of execUpdates) {
-      const ibkrId = u.ibkr_trade_id as string
-      const campId = u.campaign_id   as string | null
-      const lgId   = u.leg_group_id  as string | null
-      if (!byCampaign.has(campId)) byCampaign.set(campId, [])
-      byCampaign.get(campId)!.push(ibkrId)
-      if (lgId) legGroupMap.set(ibkrId, lgId)
-    }
-
-    const updatePromises: PromiseLike<unknown>[] = []
-    for (const [campaignId, ibkrIds] of Array.from(byCampaign.entries())) {
-      for (let i = 0; i < ibkrIds.length; i += BATCH) {
-        updatePromises.push(
-          supabase.from('raw_executions')
-            .update({ campaign_id: campaignId })
-            .in('ibkr_trade_id', ibkrIds.slice(i, i + BATCH))
-            .then(),
-        )
-      }
-    }
-    for (const [ibkrId, lgId] of Array.from(legGroupMap.entries())) {
-      updatePromises.push(
-        supabase.from('raw_executions')
-          .update({ leg_group_id: lgId })
-          .eq('ibkr_trade_id', ibkrId)
-          .then(),
-      )
-    }
-    await Promise.all(updatePromises)
-
-    // ── Done ──────────────────────────────────────────────────────────────────
     // Update last_import status in settings
     try {
-      const supabase2 = createServiceClient()
-      await supabase2.from('app_settings').update({
+      await supabase.from('app_settings').update({
         last_import_at:      new Date().toISOString(),
         last_import_status:  'success',
-        last_import_message: `${newExecutions.length} Executions, ${campaigns.length} Campaigns, ${stats?.rolls ?? 0} Rolls`,
+        last_import_message: `${newExecutions.length} Executions, ${recomp.campaigns} Campaigns, ${recomp.rolls} Rolls`,
       }).eq('id', true)
     } catch { /* non-critical */ }
 
-    await logImport('info', 'system', 'Import erfolgreich abgeschlossen', {
-      executions:        newExecutions.length,
-      fx_transactions:   fxTransactions.length,
-      cash_transactions: cashTxns.length,
-      account_snapshots: snapshots.length,
-      campaigns:         campaigns.length,
-      option_legs:       optionLegs.length,
-      rolls:             stats?.rolls ?? 0,
+    await logImport('info', 'system', 'IBKR-Import erfolgreich abgeschlossen', {
+      executions: newExecutions.length, campaigns: recomp.campaigns, rolls: recomp.rolls,
     }, runId)
 
     return NextResponse.json({
@@ -380,9 +251,9 @@ export async function POST(req: NextRequest) {
         account_snapshots: snapshots.length,
       },
       grouped: {
-        campaigns:   campaigns.length,
-        option_legs: optionLegs.length,
-        rolls:       stats?.rolls ?? 0,
+        campaigns:   recomp.campaigns,
+        option_legs: recomp.option_legs,
+        rolls:       recomp.rolls,
       },
     })
   } catch (err) {
@@ -391,12 +262,12 @@ export async function POST(req: NextRequest) {
     try {
       const supabase2 = createServiceClient()
       await supabase2.from('app_settings').update({
-        last_import_at:      new Date().toISOString(),
-        last_import_status:  'error',
+        last_import_at:     new Date().toISOString(),
+        last_import_status: 'error',
         last_import_message: message,
       }).eq('id', true)
     } catch { /* non-critical */ }
-    await logImport('error', 'system', `Import abgebrochen: ${message}`, undefined, runId)
+    await logImport('error', 'system', `IBKR-Import abgebrochen: ${message}`, undefined, runId)
     return NextResponse.json({ error: message }, { status: 500 })
   }
 }

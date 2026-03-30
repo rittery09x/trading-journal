@@ -2,13 +2,12 @@
  * POST /api/import/xml
  * ====================
  * Accepts a multipart form upload with an IBKR Flex XML file,
- * parses it via the Python microservice, and persists to Supabase.
+ * parses it via the Python microservice, and persists raw data to Supabase.
+ * Grouping is delegated to /api/recompute (called automatically after ingest).
  *
  * Form fields:
  *   activity_xml  — required, Activity Feed (AF) XML file
  *   confirms_xml  — optional, Trade Confirms (TCF) XML file
- *
- * Flow: identical to /api/import/flex but skips the IBKR fetch step.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -20,8 +19,6 @@ export const maxDuration = 120
 
 const PARSER_URL = process.env.PYTHON_PARSER_URL ?? 'http://backend:8000'
 const BATCH      = 500
-
-// ── Supabase batch helpers (same as /api/import/flex) ────────────────────────
 
 type RawExec = Record<string, unknown>
 
@@ -44,8 +41,6 @@ async function upsertBatched(
   }
   return total
 }
-
-// ── Mappers ───────────────────────────────────────────────────────────────────
 
 function toRawExecution(e: RawExec): RawExec {
   return {
@@ -81,8 +76,6 @@ function toFxTransactions(rows: RawExec[]): RawExec[] {
   return rows.map(f => {
     let ibkrId = f.ibkr_trade_id as string | null
     if (!ibkrId) {
-      // Include to_amount + rate so truly identical rows still collapse;
-      // append a counter so near-duplicates get unique IDs
       const base = `${f.trade_date}|${f.from_currency}|${f.to_currency}|${f.from_amount}|${f.to_amount}|${f.rate}|${f.description ?? ''}`
       const hash = Buffer.from(base).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)
       const key  = `fx-${hash}`
@@ -126,14 +119,6 @@ function toAccountSnapshot(s: RawExec): RawExec {
   }
 }
 
-function toOptionLeg(leg: RawExec): RawExec {
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { execution_ibkr_id, ...rest } = leg as { execution_ibkr_id?: unknown } & RawExec
-  return rest
-}
-
-// ── POST handler ──────────────────────────────────────────────────────────────
-
 export async function POST(req: NextRequest) {
   const runId = crypto.randomUUID()
 
@@ -166,10 +151,7 @@ export async function POST(req: NextRequest) {
         headers: { 'Content-Type': 'application/json' },
         body:    JSON.stringify({ activity_xml: activityXml, confirms_xml: confirmsXml }),
       })
-      if (!parseRes.ok) {
-        const detail = await parseRes.text()
-        throw new Error(`Parser HTTP ${parseRes.status}: ${detail}`)
-      }
+      if (!parseRes.ok) throw new Error(`Parser HTTP ${parseRes.status}: ${await parseRes.text()}`)
       parsed = await parseRes.json() as Record<string, unknown>
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
@@ -177,27 +159,26 @@ export async function POST(req: NextRequest) {
       throw err
     }
 
-    const newExecutions = parsed.executions        as RawExec[] ?? []
-    const fxTransactions = parsed.fx_transactions  as RawExec[] ?? []
-    const cashTxns       = parsed.cash_transactions as RawExec[] ?? []
-    const snapshots      = parsed.account_snapshots as RawExec[] ?? []
+    const newExecutions  = parsed.executions         as RawExec[] ?? []
+    const fxTransactions = parsed.fx_transactions    as RawExec[] ?? []
+    const cashTxns       = parsed.cash_transactions  as RawExec[] ?? []
+    const snapshots      = parsed.account_snapshots  as RawExec[] ?? []
 
     await logImport('info', 'parser', 'Parsing abgeschlossen', {
       executions: newExecutions.length, fx_transactions: fxTransactions.length,
       cash_transactions: cashTxns.length, account_snapshots: snapshots.length,
     }, runId)
 
-    // ── 2. Upsert raw data to Supabase ────────────────────────────────────────
-    await logImport('info', 'supabase', 'Rohdaten werden in Supabase gespeichert…', undefined, runId)
+    // ── 2. Upsert raw data ────────────────────────────────────────────────────
+    await logImport('info', 'supabase', 'Rohdaten werden gespeichert…', undefined, runId)
     try {
       await Promise.all([
-        upsertBatched(supabase, 'raw_executions',    newExecutions.map(toRawExecution),   'ibkr_trade_id'),
-        upsertBatched(supabase, 'fx_transactions',   toFxTransactions(fxTransactions),    'ibkr_trade_id'),
-        upsertBatched(supabase, 'account_snapshots', snapshots.map(toAccountSnapshot),    'snapshot_date'),
+        upsertBatched(supabase, 'raw_executions',    newExecutions.map(toRawExecution),  'ibkr_trade_id'),
+        upsertBatched(supabase, 'fx_transactions',   toFxTransactions(fxTransactions),   'ibkr_trade_id'),
+        upsertBatched(supabase, 'account_snapshots', snapshots.map(toAccountSnapshot),   'snapshot_date'),
       ])
-
-      const cashWithId    = cashTxns.filter(c => c.ibkr_trade_id).map(toCashTransaction)
-      const cashWithout   = cashTxns.filter(c => !c.ibkr_trade_id).map(toCashTransaction)
+      const cashWithId  = cashTxns.filter(c => c.ibkr_trade_id).map(toCashTransaction)
+      const cashWithout = cashTxns.filter(c => !c.ibkr_trade_id).map(toCashTransaction)
       if (cashWithId.length > 0)
         await upsertBatched(supabase, 'cash_transactions', cashWithId, 'ibkr_trade_id')
       if (cashWithout.length > 0) {
@@ -210,103 +191,19 @@ export async function POST(req: NextRequest) {
       throw err
     }
 
-    // ── 3. Fetch ALL executions for cross-import grouping ─────────────────────
-    const { data: allExecutions, error: fetchErr } = await supabase
-      .from('raw_executions')
-      .select('*')
-      .order('trade_date', { ascending: true })
-    if (fetchErr) throw new Error(`Fetch all executions: ${fetchErr.message}`)
-
-    await logImport('info', 'parser', 'Grouping-Engine wird aufgerufen…', {
-      total_executions: allExecutions?.length ?? 0,
+    await logImport('info', 'system', 'Rohdaten gespeichert — starte Grouping…', {
+      executions: newExecutions.length,
     }, runId)
 
-    // ── 4. Run grouping engine via Python ─────────────────────────────────────
-    let grouped: Record<string, unknown>
-    try {
-      const groupRes = await fetch(`${PARSER_URL}/group`, {
-        method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body:    JSON.stringify({ executions: allExecutions }),
-      })
-      if (!groupRes.ok) {
-        const detail = await groupRes.text()
-        throw new Error(`Grouping HTTP ${groupRes.status}: ${detail}`)
-      }
-      grouped = await groupRes.json() as Record<string, unknown>
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      await logImport('error', 'parser', `Grouping-Engine fehlgeschlagen: ${msg}`, undefined, runId)
-      throw err
-    }
+    // ── 3. Trigger recompute (grouping lives there) ───────────────────────────
+    const appUrl    = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+    const recompRes = await fetch(`${appUrl}/api/recompute`, { method: 'POST' })
+    const recomp    = await recompRes.json() as Record<string, unknown>
 
-    const campaigns   = grouped.campaigns          as RawExec[] ?? []
-    const optionLegs  = grouped.option_legs        as RawExec[] ?? []
-    const execUpdates = grouped.execution_updates  as RawExec[] ?? []
-    const stats       = grouped.stats as Record<string, number> | undefined
-
-    // ── 5. Upsert campaigns + option_legs ─────────────────────────────────────
-    // Two-pass for option_legs: insert without rolled_to_leg_id first to avoid
-    // FK constraint violations, then patch the references in a second pass.
-    try {
-      await upsertBatched(supabase, 'campaigns', campaigns, 'id')
-
-      const legsWithoutRef = optionLegs.map(l => ({ ...toOptionLeg(l), rolled_to_leg_id: null }))
-      await upsertBatched(supabase, 'option_legs', legsWithoutRef, 'id')
-
-      // Second pass: set rolled_to_leg_id where present
-      const rollRefs = optionLegs.filter(l => (l as RawExec).rolled_to_leg_id)
-      for (const leg of rollRefs) {
-        await supabase
-          .from('option_legs')
-          .update({ rolled_to_leg_id: (leg as RawExec).rolled_to_leg_id })
-          .eq('id', (leg as RawExec).id)
-      }
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      await logImport('error', 'supabase', `Campaign-Upsert fehlgeschlagen: ${msg}`, undefined, runId)
-      throw err
-    }
-
-    // ── 6. Link raw_executions → campaign_id + leg_group_id ──────────────────
-    const byCampaign  = new Map<string | null, string[]>()
-    const legGroupMap = new Map<string, string>()
-
-    for (const u of execUpdates) {
-      const ibkrId = u.ibkr_trade_id as string
-      const campId = u.campaign_id   as string | null
-      const lgId   = u.leg_group_id  as string | null
-      if (!byCampaign.has(campId)) byCampaign.set(campId, [])
-      byCampaign.get(campId)!.push(ibkrId)
-      if (lgId) legGroupMap.set(ibkrId, lgId)
-    }
-
-    const updatePromises: PromiseLike<unknown>[] = []
-    for (const [campaignId, ibkrIds] of Array.from(byCampaign.entries())) {
-      for (let i = 0; i < ibkrIds.length; i += BATCH) {
-        updatePromises.push(
-          supabase.from('raw_executions')
-            .update({ campaign_id: campaignId })
-            .in('ibkr_trade_id', ibkrIds.slice(i, i + BATCH))
-            .then(),
-        )
-      }
-    }
-    for (const [ibkrId, lgId] of Array.from(legGroupMap.entries())) {
-      updatePromises.push(
-        supabase.from('raw_executions')
-          .update({ leg_group_id: lgId })
-          .eq('ibkr_trade_id', ibkrId)
-          .then(),
-      )
-    }
-    await Promise.all(updatePromises)
+    if (!recompRes.ok) throw new Error(`Recompute fehlgeschlagen: ${recomp.error ?? recompRes.status}`)
 
     await logImport('info', 'system', 'XML-Import erfolgreich abgeschlossen', {
-      executions: newExecutions.length, fx_transactions: fxTransactions.length,
-      cash_transactions: cashTxns.length, account_snapshots: snapshots.length,
-      campaigns: campaigns.length, option_legs: optionLegs.length,
-      rolls: stats?.rolls ?? 0,
+      executions: newExecutions.length, campaigns: recomp.campaigns, rolls: recomp.rolls,
     }, runId)
 
     return NextResponse.json({
@@ -319,9 +216,9 @@ export async function POST(req: NextRequest) {
         account_snapshots: snapshots.length,
       },
       grouped: {
-        campaigns:   campaigns.length,
-        option_legs: optionLegs.length,
-        rolls:       stats?.rolls ?? 0,
+        campaigns:   recomp.campaigns,
+        option_legs: recomp.option_legs,
+        rolls:       recomp.rolls,
       },
     })
   } catch (err) {

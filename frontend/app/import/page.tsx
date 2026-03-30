@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useRef, useCallback, DragEvent, ChangeEvent } from 'react'
-import { Upload, CheckCircle, AlertCircle, Loader2, RefreshCw, FileText, X, CloudDownload } from 'lucide-react'
+import { Upload, CheckCircle, AlertCircle, Loader2, RefreshCw, FileText, X, CloudDownload, Calculator } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 type Tab = 'file' | 'ibkr'
@@ -131,6 +131,7 @@ export default function ImportPage() {
   const [tab, setTab]           = useState<Tab>('file')
   const [loading, setLoading]   = useState(false)
   const [result, setResult]     = useState<ImportResult | null>(null)
+  const [recomputing, setRecomputing] = useState(false)
 
   // File upload state
   const [activityFile, setActivityFile] = useState<File | null>(null)
@@ -186,6 +187,28 @@ export default function ImportPage() {
     }
   }
 
+  async function handleRecompute() {
+    setRecomputing(true)
+    setResult(null)
+    try {
+      const res  = await fetch('/api/recompute', { method: 'POST' })
+      const json = await res.json()
+      if (res.ok) {
+        setResult({
+          ok: true,
+          imported: { executions: 0, fx_transactions: 0, cash_transactions: 0, account_snapshots: 0 },
+          grouped:  { campaigns: json.campaigns, option_legs: json.option_legs, rolls: json.rolls },
+        })
+      } else {
+        setResult({ ok: false, message: json.error ?? `HTTP ${res.status}` })
+      }
+    } catch (e) {
+      setResult({ ok: false, message: e instanceof Error ? e.message : 'Netzwerkfehler' })
+    } finally {
+      setRecomputing(false)
+    }
+  }
+
   const tabs: { id: Tab; label: string; icon: typeof Upload }[] = [
     { id: 'file', label: 'XML hochladen',     icon: Upload        },
     { id: 'ibkr', label: 'Von IBKR abrufen',  icon: CloudDownload },
@@ -217,6 +240,25 @@ export default function ImportPage() {
             {label}
           </button>
         ))}
+      </div>
+
+      {/* ── Neu berechnen ────────────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between rounded-lg border border-border bg-card px-5 py-3">
+        <div>
+          <p className="text-sm font-medium text-foreground">Neu berechnen</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Campaigns &amp; Legs aus vorhandenen Rohdaten neu berechnen — ohne neuen Import.
+          </p>
+        </div>
+        <button
+          onClick={handleRecompute}
+          disabled={recomputing || loading}
+          className="flex items-center gap-2 rounded-md border border-border bg-background px-4 py-2 text-sm font-medium text-foreground hover:bg-accent disabled:opacity-50 disabled:cursor-not-allowed transition-colors flex-shrink-0 ml-4"
+        >
+          {recomputing
+            ? <><Loader2 className="h-4 w-4 animate-spin" />Berechne…</>
+            : <><Calculator className="h-4 w-4" />Neu berechnen</>}
+        </button>
       </div>
 
       {/* ── File upload tab ─────────────────────────────────────────────────── */}
