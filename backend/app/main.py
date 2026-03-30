@@ -3,7 +3,7 @@ import os
 from datetime import date, datetime
 from typing import Any, List, Optional
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -77,30 +77,16 @@ def health():
 
 
 @app.post("/parse")
-async def parse(
-    activity_file: Optional[UploadFile] = File(None),
-    confirms_file: Optional[UploadFile] = File(None),
-    body: Optional[ParseRequest] = None,
-):
+async def parse(body: ParseRequest):
     """
     Parse IBKR Flex Query XMLs (Activity Feed + Trade Confirms).
-    Accepts multipart file uploads OR JSON body with raw XML strings.
+    Accepts a JSON body with raw XML strings (activity_xml, confirms_xml).
 
     Returns structured executions, FX transactions, cash transactions
     and account snapshots ready for Supabase upsert.
     """
-    activity_xml: Optional[str] = None
-    confirms_xml: Optional[str] = None
-
-    if activity_file:
-        activity_xml = (await activity_file.read()).decode("utf-8")
-    elif body and body.activity_xml:
-        activity_xml = body.activity_xml
-
-    if confirms_file:
-        confirms_xml = (await confirms_file.read()).decode("utf-8")
-    elif body and body.confirms_xml:
-        confirms_xml = body.confirms_xml
+    activity_xml: Optional[str] = body.activity_xml or None
+    confirms_xml: Optional[str] = body.confirms_xml or None
 
     if not activity_xml and not confirms_xml:
         raise HTTPException(
