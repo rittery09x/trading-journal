@@ -86,6 +86,8 @@ async function pollStatement(
       if (status !== 'Success') {
         const code = extractTag(xml, 'ErrorCode')
         const msg  = extractTag(xml, 'ErrorMessage')
+        // 1019 = "Statement generation in progress" → retry like Processing
+        if (code === '1019') continue
         throw new Error(`IBKR error (${code}): ${msg}`)
       }
     }
