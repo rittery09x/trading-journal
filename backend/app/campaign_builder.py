@@ -8,12 +8,14 @@ Produces:
   - option_legs:        list[dict] → option_legs table (with deterministic IDs)
   - execution_updates:  list[dict] → update raw_executions with campaign_id / leg_group_id
 
+Design: one option_leg per POSITION (not per execution).
+  A position = unique (campaign, option_type, strike, expiry).
+  Multiple partial fills are aggregated into one leg.
+  Status is derived from closing events (BTC / expiry / assignment) found for that position.
+
 Deterministic UUIDs (uuid5) ensure idempotent upserts on re-import:
   - campaign_id  = uuid5(ns, "campaign:{UNDERLYING}")
-  - option_leg id = uuid5(ns, "optleg:{ibkr_trade_id}")
-
-Roll FK resolution (rolled_to_leg_id / rolled_from_leg_id) is done within this
-module once all leg IDs are known, so the API layer can do a straight upsert.
+  - option_leg id = uuid5(ns, "optleg:{first_ibkr_trade_id_of_position}")
 """
 
 from __future__ import annotations
@@ -45,7 +47,6 @@ def _optleg_id(ibkr_trade_id: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _safe(val: Any) -> Optional[Any]:
-    """Returns None for NaN/None, else the value."""
     if val is None:
         return None
     if isinstance(val, float) and math.isnan(val):
@@ -54,7 +55,6 @@ def _safe(val: Any) -> Optional[Any]:
 
 
 def _date_str(val: Any) -> Optional[str]:
-    """Returns ISO date string YYYY-MM-DD or None."""
     v = _safe(val)
     if v is None:
         return None
@@ -87,11 +87,10 @@ def _str(val: Any) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Leg type / status derivation
+# Leg type derivation
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _leg_type(option_type: str, action: str) -> str:
-    """Derives option leg type from option_type (C/P) and action (BUY/SELL)."""
     ot = _str(option_type).upper()
     ac = _str(action).upper()
     if ot == "P":
@@ -101,24 +100,6 @@ def _leg_type(option_type: str, action: str) -> str:
     return "long_put"
 
 
-def _leg_status(row: dict) -> str:
-    """
-    Derives option leg status.
-    Priority: expired > assigned > rolled (BTC) > closed > open
-    """
-    if _bool(row.get("is_expired")):
-        return "expired"
-    if _bool(row.get("is_assignment")):
-        return "assigned"
-    # A BTC that was rolled has a rolled_to_id set
-    if _safe(row.get("rolled_to_id")):
-        return "rolled"
-    oci = _str(row.get("open_close_indicator")).upper()
-    if oci == "C":
-        return "closed"
-    return "open"
-
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Main builder
 # ──────────────────────────────────────────────────────────────────────────────
@@ -126,6 +107,9 @@ def _leg_status(row: dict) -> str:
 def build_campaigns_and_legs(df: pd.DataFrame) -> dict:
     """
     Converts the grouping engine output DataFrame to DB-ready records.
+
+    One option_leg is created per POSITION (campaign + option_type + strike + expiry),
+    aggregating all partial fills. Status is derived from matching closing events.
 
     Args:
         df: Output of run_grouping_pipeline()
@@ -137,56 +121,53 @@ def build_campaigns_and_legs(df: pd.DataFrame) -> dict:
           "execution_updates": list[dict],
         }
     """
-    campaigns_map: dict[str, dict] = {}   # campaign_id → record
-    option_legs: list[dict] = []
+    campaigns_map: dict[str, dict] = {}
     execution_updates: list[dict] = []
 
-    # ibkr_trade_id → option_leg UUID (for roll FK resolution)
-    ibkr_to_leg_id: dict[str, str] = {}
+    # position key → {"openings": [...], "closings": [...]}
+    # key = (camp_id, option_type, strike, expiry)
+    pos_data: dict[tuple, dict] = {}
 
+    # ── Pass 1: Build campaigns + collect OPT executions by position ──────────
     for _, row in df.iterrows():
         r = row.to_dict()
 
-        campaign_key  = _safe(r.get("campaign_key"))     # = underlying symbol
+        campaign_key  = _safe(r.get("campaign_key"))
         ibkr_id       = _str(r.get("ibkr_trade_id"))
         asset_class   = _str(r.get("asset_class")).upper()
         action        = _str(r.get("action")).upper()
-        underlying    = _str(r.get("underlying") or r.get("symbol"))
         trade_date    = _date_str(r.get("trade_date"))
         currency      = _str(r.get("currency")) or "USD"
 
-        # ── Campaign initialization ─────────────────────────────────────────
+        # ── Campaign init ───────────────────────────────────────────────────
         camp_id: Optional[str] = None
         if campaign_key:
             camp_id = _campaign_id(str(campaign_key))
 
             if camp_id not in campaigns_map:
                 campaigns_map[camp_id] = {
-                    "id": camp_id,
-                    "underlying": str(campaign_key).strip().upper(),
-                    "status": "open",
-                    "strategy_type": "custom",
-                    "started_at": trade_date,
-                    "stock_quantity": 0.0,
-                    "effective_avg_cost": None,
-                    "broker_avg_cost": None,
-                    "total_option_premium": 0.0,
+                    "id":                    camp_id,
+                    "underlying":            str(campaign_key).strip().upper(),
+                    "status":                "open",
+                    "strategy_type":         "custom",
+                    "started_at":            trade_date,
+                    "stock_quantity":        0.0,
+                    "effective_avg_cost":    None,
+                    "broker_avg_cost":       None,
+                    "total_option_premium":  0.0,
                     "cost_basis_adjustment": 0.0,
-                    "realized_pnl_total": 0.0,
-                    "open_option_legs": 0,
-                    "currency": currency,
-                    "notes": None,
+                    "realized_pnl_total":    0.0,
+                    "open_option_legs":      0,
+                    "currency":              currency,
+                    "notes":                 None,
                 }
 
             camp = campaigns_map[camp_id]
 
-            # Update started_at to min trade date
             if trade_date and (camp["started_at"] is None or trade_date < camp["started_at"]):
                 camp["started_at"] = trade_date
 
-            # Stock quantity tracking
-            # Use abs() because IBKR reports SELL quantities as negative values;
-            # direction is already captured by action (BUY/SELL).
+            # Stock tracking
             qty = abs(_float(r.get("quantity")) or 0.0)
             if asset_class == "STK":
                 if action == "BUY":
@@ -197,78 +178,181 @@ def build_campaigns_and_legs(df: pd.DataFrame) -> dict:
                 elif action == "SELL":
                     camp["stock_quantity"] -= qty
 
-            # Realized PnL accumulation
             rpnl = _float(r.get("realized_pnl")) or 0.0
             camp["realized_pnl_total"] += rpnl
 
-        # ── Execution update (for raw_executions back-fill) ─────────────────
+        # ── Execution update ────────────────────────────────────────────────
         execution_updates.append({
             "ibkr_trade_id": ibkr_id,
             "campaign_id":   camp_id,
             "leg_group_id":  str(_safe(r.get("leg_group_id")) or ""),
         })
 
-        # ── Option leg record ───────────────────────────────────────────────
-        if asset_class == "OPT":
-            oci    = _str(r.get("open_close_indicator")).upper()
-            status = _leg_status(r)
+        # ── Collect OPT executions by position key ──────────────────────────
+        if asset_class == "OPT" and camp_id:
+            oci          = _str(r.get("open_close_indicator")).upper()
+            is_expired   = _bool(r.get("is_expired"))
+            is_assignment = _bool(r.get("is_assignment"))
 
-            # Track open legs per campaign:
-            # +1 for opening executions, -1 for closing executions (BTC/assigned/rolled)
-            if camp_id:
-                if oci == "O" and status == "open":
-                    campaigns_map[camp_id]["open_option_legs"] += 1
-                elif oci == "C" and status in ("closed", "assigned", "rolled"):
-                    campaigns_map[camp_id]["open_option_legs"] -= 1
+            pos_key = (
+                camp_id,
+                _str(r.get("option_type")).upper(),
+                _float(r.get("option_strike")),
+                _date_str(r.get("option_expiry")),
+            )
 
-            # Net PnL
-            gross_pnl  = _float(r.get("realized_pnl"))
-            commission = abs(_float(r.get("commission")) or 0.0)
-            net_pnl    = (gross_pnl - commission) if gross_pnl is not None else None
+            if pos_key not in pos_data:
+                pos_data[pos_key] = {"openings": [], "closings": []}
 
-            # Accumulate option premium into campaign
-            if camp_id and net_pnl is not None and status in ("closed", "expired", "assigned", "rolled"):
+            # Opening: OCI=O, not an expiry/assignment correction
+            is_opening = (oci == "O" and not is_expired and not is_assignment)
+
+            if is_opening:
+                pos_data[pos_key]["openings"].append(r)
+            else:
+                pos_data[pos_key]["closings"].append(r)
+
+    # ── Pass 2: Build one option_leg per position ─────────────────────────────
+    option_legs: list[dict] = []
+    ibkr_to_leg_id: dict[str, str] = {}
+
+    for pos_key, data in pos_data.items():
+        openings = data["openings"]
+        closings = data["closings"]
+
+        if not openings:
+            # Closing events with no corresponding opening (e.g. data gap) — skip
+            continue
+
+        camp_id, option_type, strike, expiry = pos_key
+
+        # Sort openings by date for deterministic primary ID
+        openings = sorted(openings, key=lambda r: r.get("trade_date") or "")
+        first    = openings[0]
+        primary_ibkr_id = _str(first.get("ibkr_trade_id"))
+        leg_id   = _optleg_id(primary_ibkr_id)
+
+        # Register all opening ibkr_ids → this leg
+        for r in openings:
+            ibkr_to_leg_id[_str(r.get("ibkr_trade_id"))] = leg_id
+
+        # Register all closing ibkr_ids → this leg (for rolled_from FK on successor)
+        for r in closings:
+            ibkr_to_leg_id[_str(r.get("ibkr_trade_id"))] = leg_id
+
+        # ── Determine status ────────────────────────────────────────────────
+        has_roll       = any(_safe(r.get("rolled_to_id")) for r in closings)
+        has_expiry     = any(_bool(r.get("is_expired"))   for r in closings)
+        has_assignment = any(_bool(r.get("is_assignment")) for r in closings)
+
+        total_open_qty  = sum(abs(_float(r.get("quantity")) or 0) for r in openings)
+        total_close_qty = sum(abs(_float(r.get("quantity")) or 0) for r in closings)
+
+        if has_roll:
+            status = "rolled"
+        elif has_expiry:
+            status = "expired"
+        elif has_assignment:
+            status = "assigned"
+        elif total_close_qty >= total_open_qty * 0.99:  # fully closed (99% threshold)
+            status = "closed"
+        elif closings:
+            status = "open"   # partially closed
+        else:
+            status = "open"
+
+        # ── Prices ─────────────────────────────────────────────────────────
+        # Weighted-average open price across partial fills
+        total_price_weighted = sum(
+            (_float(r.get("price")) or 0.0) * abs(_float(r.get("quantity")) or 0.0)
+            for r in openings
+        )
+        open_price = total_price_weighted / total_open_qty if total_open_qty > 0 else None
+
+        # Weighted-average close price (0 for expiry)
+        close_price: Optional[float] = None
+        if closings and not has_expiry:
+            total_close_weighted = sum(
+                (_float(r.get("price")) or 0.0) * abs(_float(r.get("quantity")) or 0.0)
+                for r in closings
+            )
+            close_price = total_close_weighted / total_close_qty if total_close_qty > 0 else None
+
+        # ── PnL ────────────────────────────────────────────────────────────
+        gross_pnl: Optional[float] = None
+        if closings:
+            pnl_values = [_float(r.get("realized_pnl")) for r in closings]
+            valid = [v for v in pnl_values if v is not None]
+            if valid:
+                gross_pnl = sum(valid)
+
+        commission = sum(
+            abs(_float(r.get("commission")) or 0.0)
+            for r in openings + closings
+        )
+        net_pnl = (gross_pnl - commission) if gross_pnl is not None else None
+
+        # ── Roll references ─────────────────────────────────────────────────
+        rolled_to_ibkr: Optional[str] = None
+        if has_roll:
+            roll_btcs = [r for r in closings if _safe(r.get("rolled_to_id"))]
+            if roll_btcs:
+                rolled_to_ibkr = str(_safe(roll_btcs[0].get("rolled_to_id")))
+
+        rolled_from_ibkr: Optional[str] = None
+        rolled_froms = [r for r in openings if _safe(r.get("rolled_from_id"))]
+        if rolled_froms:
+            rolled_from_ibkr = str(_safe(rolled_froms[0].get("rolled_from_id")))
+
+        # ── Cost basis carried (roll-in) ────────────────────────────────────
+        cost_basis_carried = _float(first.get("cost_basis_carried")) or 0.0
+
+        # ── Leg type from first opening ─────────────────────────────────────
+        first_action = _str(first.get("action")).upper()
+        leg_type     = _leg_type(_str(first.get("option_type")), first_action)
+
+        # ── Update campaign totals ──────────────────────────────────────────
+        if camp_id in campaigns_map:
+            if status in ("closed", "expired", "assigned", "rolled") and net_pnl is not None:
                 campaigns_map[camp_id]["total_option_premium"] += net_pnl
                 if status == "rolled":
                     campaigns_map[camp_id]["cost_basis_adjustment"] += net_pnl
 
-            cost_basis_carried = _float(r.get("cost_basis_carried")) or 0.0
+            if status == "open":
+                campaigns_map[camp_id]["open_option_legs"] += 1
 
-            leg_id = _optleg_id(ibkr_id)
-            ibkr_to_leg_id[ibkr_id] = leg_id
+        option_legs.append({
+            "id":               leg_id,
+            "campaign_id":      camp_id,
+            # temporary fields for roll FK resolution (removed below)
+            "_ibkr_id":         primary_ibkr_id,
+            "_rolled_to_ibkr":  rolled_to_ibkr,
+            "_rolled_from_ibkr": rolled_from_ibkr,
+            # DB columns
+            "leg_type":           leg_type,
+            "status":             status,
+            "strike":             strike,
+            "expiry":             expiry,
+            "open_date":          _date_str(first.get("trade_date")),
+            "open_price":         open_price,
+            "close_price":        close_price,
+            "quantity":           total_open_qty,
+            "multiplier":         _float(first.get("option_multiplier")) or 100.0,
+            "gross_pnl":          gross_pnl,
+            "commission_total":   commission,
+            "net_pnl":            net_pnl,
+            "cost_basis_carried": cost_basis_carried,
+            "rolled_to_leg_id":   None,   # resolved below
+            "rolled_from_leg_id": None,   # resolved below
+        })
 
-            option_legs.append({
-                "id":               leg_id,
-                "campaign_id":      camp_id,
-                # temporary fields for roll FK resolution (removed below)
-                "_ibkr_id":         ibkr_id,
-                "_rolled_to_ibkr":  _safe(r.get("rolled_to_id")),
-                "_rolled_from_ibkr": _safe(r.get("rolled_from_id")),
-                # DB columns
-                "leg_type":         _leg_type(_str(r.get("option_type")), action),
-                "status":           status,
-                "strike":           _float(r.get("option_strike")),
-                "expiry":           _date_str(r.get("option_expiry")),
-                "open_date":        trade_date,
-                "open_price":       _float(r.get("price")),
-                "close_price":      None,
-                "quantity":         _float(r.get("quantity")),
-                "multiplier":       _float(r.get("option_multiplier")) or 100.0,
-                "gross_pnl":        gross_pnl,
-                "commission_total": commission,
-                "net_pnl":          net_pnl,
-                "cost_basis_carried": cost_basis_carried,
-                "rolled_to_leg_id":   None,   # resolved below
-                "rolled_from_leg_id": None,   # resolved below
-            })
-
-    # ── Resolve roll FK references ──────────────────────────────────────────
+    # ── Resolve roll FK references ────────────────────────────────────────────
     for leg in option_legs:
         leg["rolled_to_leg_id"]   = ibkr_to_leg_id.get(leg.pop("_rolled_to_ibkr")   or "") or None
         leg["rolled_from_leg_id"] = ibkr_to_leg_id.get(leg.pop("_rolled_from_ibkr") or "") or None
         leg.pop("_ibkr_id")
 
-    # ── Finalize campaign status ────────────────────────────────────────────
+    # ── Finalize campaign status ──────────────────────────────────────────────
     for camp in campaigns_map.values():
         camp["open_option_legs"] = max(0, camp["open_option_legs"])
         camp["stock_quantity"]   = max(0.0, camp["stock_quantity"])
