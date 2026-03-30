@@ -246,9 +246,22 @@ export async function POST(req: NextRequest) {
     const stats       = grouped.stats as Record<string, number> | undefined
 
     // ── 5. Upsert campaigns + option_legs ─────────────────────────────────────
+    // Two-pass for option_legs: insert without rolled_to_leg_id first to avoid
+    // FK constraint violations, then patch the references in a second pass.
     try {
-      await upsertBatched(supabase, 'campaigns',   campaigns,                           'id')
-      await upsertBatched(supabase, 'option_legs', optionLegs.map(toOptionLeg),         'id')
+      await upsertBatched(supabase, 'campaigns', campaigns, 'id')
+
+      const legsWithoutRef = optionLegs.map(l => ({ ...toOptionLeg(l), rolled_to_leg_id: null }))
+      await upsertBatched(supabase, 'option_legs', legsWithoutRef, 'id')
+
+      // Second pass: set rolled_to_leg_id where present
+      const rollRefs = optionLegs.filter(l => (l as RawExec).rolled_to_leg_id)
+      for (const leg of rollRefs) {
+        await supabase
+          .from('option_legs')
+          .update({ rolled_to_leg_id: (leg as RawExec).rolled_to_leg_id })
+          .eq('id', (leg as RawExec).id)
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       await logImport('error', 'supabase', `Campaign-Upsert fehlgeschlagen: ${msg}`, undefined, runId)

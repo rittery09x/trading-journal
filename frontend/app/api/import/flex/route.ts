@@ -297,8 +297,18 @@ export async function POST(req: NextRequest) {
     // ── 6. Upsert campaigns + option_legs ─────────────────────────────────────
     await logImport('info', 'supabase', 'Campaigns und Legs werden gespeichert…', undefined, runId)
     try {
-      await upsertBatched(supabase, 'campaigns',   campaigns,                   'id')
-      await upsertBatched(supabase, 'option_legs', optionLegs.map(toOptionLeg), 'id')
+      await upsertBatched(supabase, 'campaigns', campaigns, 'id')
+
+      const legsWithoutRef = optionLegs.map(l => ({ ...toOptionLeg(l), rolled_to_leg_id: null }))
+      await upsertBatched(supabase, 'option_legs', legsWithoutRef, 'id')
+
+      const rollRefs = optionLegs.filter(l => l.rolled_to_leg_id)
+      for (const leg of rollRefs) {
+        await supabase
+          .from('option_legs')
+          .update({ rolled_to_leg_id: leg.rolled_to_leg_id })
+          .eq('id', leg.id)
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)
       await logImport('error', 'supabase', `Campaign-Upsert fehlgeschlagen: ${msg}`, undefined, runId)
