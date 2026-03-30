@@ -235,7 +235,6 @@ def _parse_af(xml_str: str) -> tuple[dict, list, list, list]:
     Returns: (trades_by_id, fx_transactions, cash_transactions, account_snapshots)
     """
     root = ET.fromstring(xml_str)
-    assert root.attrib.get("type") == "AF", f"Erwartet type=AF, bekam: {root.attrib.get('type')}"
 
     trades_by_id: dict[str, dict] = {}
     fx_transactions: list[ParsedFxTransaction] = []
@@ -347,7 +346,6 @@ def _parse_tcf(xml_str: str) -> dict[str, str]:
     AF ist Hauptquelle für alle anderen Felder.
     """
     root = ET.fromstring(xml_str)
-    assert root.attrib.get("type") == "TCF", f"Erwartet type=TCF, bekam: {root.attrib.get('type')}"
 
     codes_by_id: dict[str, str] = {}
     for confirm in root.findall(".//TradeConfirm"):
