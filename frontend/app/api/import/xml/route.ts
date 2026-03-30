@@ -76,24 +76,31 @@ function toRawExecution(e: RawExec): RawExec {
   }
 }
 
-function toFxTransaction(f: RawExec): RawExec {
-  // Generate a stable synthetic ID if IBKR didn't provide one
-  let ibkrId = f.ibkr_trade_id as string | null
-  if (!ibkrId) {
-    const raw  = `${f.trade_date}|${f.from_currency}|${f.to_currency}|${f.from_amount}|${f.description ?? ''}`
-    const hash = Buffer.from(raw).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)
-    ibkrId = `fx-${hash}`
-  }
-  return {
-    ibkr_trade_id: ibkrId,
-    from_currency:  f.from_currency,
-    to_currency:    f.to_currency,
-    from_amount:    f.from_amount,
-    to_amount:      f.to_amount,
-    rate:           f.rate,
-    trade_date:     f.trade_date,
-    description:    f.description ?? null,
-  }
+function toFxTransactions(rows: RawExec[]): RawExec[] {
+  const seen = new Map<string, number>()
+  return rows.map(f => {
+    let ibkrId = f.ibkr_trade_id as string | null
+    if (!ibkrId) {
+      // Include to_amount + rate so truly identical rows still collapse;
+      // append a counter so near-duplicates get unique IDs
+      const base = `${f.trade_date}|${f.from_currency}|${f.to_currency}|${f.from_amount}|${f.to_amount}|${f.rate}|${f.description ?? ''}`
+      const hash = Buffer.from(base).toString('base64').replace(/[^a-zA-Z0-9]/g, '').slice(0, 16)
+      const key  = `fx-${hash}`
+      const n    = seen.get(key) ?? 0
+      seen.set(key, n + 1)
+      ibkrId = n === 0 ? key : `${key}-${n}`
+    }
+    return {
+      ibkr_trade_id: ibkrId,
+      from_currency:  f.from_currency,
+      to_currency:    f.to_currency,
+      from_amount:    f.from_amount,
+      to_amount:      f.to_amount,
+      rate:           f.rate,
+      trade_date:     f.trade_date,
+      description:    f.description ?? null,
+    }
+  })
 }
 
 function toCashTransaction(c: RawExec): RawExec {
@@ -185,7 +192,7 @@ export async function POST(req: NextRequest) {
     try {
       await Promise.all([
         upsertBatched(supabase, 'raw_executions',    newExecutions.map(toRawExecution),   'ibkr_trade_id'),
-        upsertBatched(supabase, 'fx_transactions',   fxTransactions.map(toFxTransaction), 'ibkr_trade_id'),
+        upsertBatched(supabase, 'fx_transactions',   toFxTransactions(fxTransactions),    'ibkr_trade_id'),
         upsertBatched(supabase, 'account_snapshots', snapshots.map(toAccountSnapshot),    'snapshot_date'),
       ])
 
