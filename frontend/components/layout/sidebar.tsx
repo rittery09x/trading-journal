@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import { BarChart3, Layers, Calendar, TrendingUp, BarChart2, Upload, ScrollText, LogOut } from 'lucide-react'
+import { BarChart3, Layers, Calendar, TrendingUp, BarChart2, Upload, ScrollText, Settings, LogOut } from 'lucide-react'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { createBrowserClient } from '@/lib/supabase/client'
 import { cn } from '@/lib/utils'
@@ -13,8 +13,9 @@ const NAV = [
   { href: '/kalender',     label: 'Kalender',     icon: Calendar   },
   { href: '/cashflow',     label: 'Cashflow',     icon: TrendingUp },
   { href: '/statistiken',  label: 'Statistiken',  icon: BarChart2  },
-  { href: '/import',       label: 'Import',       icon: Upload     },
-  { href: '/logs',         label: 'Logs',         icon: ScrollText },
+  { href: '/import',         label: 'Import',         icon: Upload        },
+  { href: '/logs',           label: 'Logs',           icon: ScrollText    },
+  { href: '/einstellungen',  label: 'Einstellungen',  icon: Settings      },
 ] as const
 
 export function Sidebar() {

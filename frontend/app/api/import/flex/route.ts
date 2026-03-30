@@ -145,13 +145,25 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const token    = process.env.FLEX_QUERY_TOKEN
-  const queryAF  = process.env.FLEX_QUERY_ID_ACTIVITY
-  const queryTCF = process.env.FLEX_QUERY_ID_CONFIRMS
+  // Credentials: DB settings take precedence over env vars
+  let token    = process.env.FLEX_QUERY_TOKEN
+  let queryAF  = process.env.FLEX_QUERY_ID_ACTIVITY
+  let queryTCF = process.env.FLEX_QUERY_ID_CONFIRMS
+
+  try {
+    const supabase = createServiceClient()
+    const { data } = await supabase
+      .from('app_settings')
+      .select('flex_token, flex_query_id_activity, flex_query_id_confirms')
+      .single()
+    if (data?.flex_token)             token    = data.flex_token
+    if (data?.flex_query_id_activity) queryAF  = data.flex_query_id_activity
+    if (data?.flex_query_id_confirms) queryTCF = data.flex_query_id_confirms
+  } catch { /* fall back to env vars */ }
 
   if (!token || !queryAF || !queryTCF) {
     return NextResponse.json(
-      { error: 'Missing FLEX_QUERY_TOKEN / FLEX_QUERY_ID_ACTIVITY / FLEX_QUERY_ID_CONFIRMS' },
+      { error: 'Bitte Token und Query-IDs in den Einstellungen hinterlegen.' },
       { status: 500 },
     )
   }
@@ -328,6 +340,16 @@ export async function POST(req: NextRequest) {
     await Promise.all(updatePromises)
 
     // ── Done ──────────────────────────────────────────────────────────────────
+    // Update last_import status in settings
+    try {
+      const supabase2 = createServiceClient()
+      await supabase2.from('app_settings').update({
+        last_import_at:      new Date().toISOString(),
+        last_import_status:  'success',
+        last_import_message: `${newExecutions.length} Executions, ${campaigns.length} Campaigns, ${stats?.rolls ?? 0} Rolls`,
+      }).eq('id', true)
+    } catch { /* non-critical */ }
+
     await logImport('info', 'system', 'Import erfolgreich abgeschlossen', {
       executions:        newExecutions.length,
       fx_transactions:   fxTransactions.length,
@@ -356,7 +378,14 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     console.error('[import/flex]', message)
-    // Log to DB if not already logged at source
+    try {
+      const supabase2 = createServiceClient()
+      await supabase2.from('app_settings').update({
+        last_import_at:      new Date().toISOString(),
+        last_import_status:  'error',
+        last_import_message: message,
+      }).eq('id', true)
+    } catch { /* non-critical */ }
     await logImport('error', 'system', `Import abgebrochen: ${message}`, undefined, runId)
     return NextResponse.json({ error: message }, { status: 500 })
   }
