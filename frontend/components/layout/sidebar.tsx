@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import { BarChart3, Layers, Calendar, TrendingUp, BarChart2, Upload, LogOut } from 'lucide-react'
+import { BarChart3, Layers, Calendar, TrendingUp, BarChart2, Upload, ScrollText, LogOut } from 'lucide-react'
 import { ThemeToggle } from '@/components/theme-toggle'
 import { createBrowserClient } from '@/lib/supabase/client'
 import { cn } from '@/lib/utils'
@@ -14,6 +14,7 @@ const NAV = [
   { href: '/cashflow',     label: 'Cashflow',     icon: TrendingUp },
   { href: '/statistiken',  label: 'Statistiken',  icon: BarChart2  },
   { href: '/import',       label: 'Import',       icon: Upload     },
+  { href: '/logs',         label: 'Logs',         icon: ScrollText },
 ] as const
 
 export function Sidebar() {
