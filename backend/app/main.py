@@ -94,6 +94,22 @@ async def parse(body: ParseRequest):
             detail="Provide at least one XML source (activity_xml or confirms_xml)",
         )
 
+    # DEBUG: log XML structure to identify element names
+    import xml.etree.ElementTree as ET
+    if activity_xml:
+        try:
+            dbg_root = ET.fromstring(activity_xml)
+            dbg_children = [c.tag for c in dbg_root][:10]
+            dbg_trades = dbg_root.findall(".//Trade")
+            dbg_all_tags = list({el.tag for el in dbg_root.iter()})[:30]
+            print(f"[DEBUG AF] root.tag={dbg_root.tag} root.attrib={dict(dbg_root.attrib)}")
+            print(f"[DEBUG AF] direct children tags: {dbg_children}")
+            print(f"[DEBUG AF] Trade elements found: {len(dbg_trades)}")
+            print(f"[DEBUG AF] all tags in XML: {sorted(dbg_all_tags)}")
+            print(f"[DEBUG AF] XML snippet: {activity_xml[:500]}")
+        except Exception as e:
+            print(f"[DEBUG AF] parse error: {e}")
+
     from app.parser import merge_feeds
 
     result = merge_feeds(activity_xml, confirms_xml)
